@@ -13,6 +13,7 @@ final class Speaker: ObservableObject {
     @Published var artwork: URL?
     @Published var playing = false
     private var pendingSend: Task<Void, Never>?
+    private let radio = RadioStreamLookup()
 
     private func getValue(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: "http://\(speakerHost)/api/getData?path=\(path)&roles=value"),
@@ -41,8 +42,16 @@ final class Speaker: ObservableObject {
             if newSubtitle.isEmpty, meta?["radioStation"] as? Bool == true {
                 newSubtitle = meta?["slogan"] as? String ?? ""
                 let stream = meta?["organization"] as? String ?? ""
-                if let song = await Self.fipNowPlaying(stream: stream, title: newTitle) {
-                    newSource = newTitle
+                let station = (player?["mediaRoles"] as? [String: Any])?["title"] as? String ?? newTitle
+                var song: Song?
+                // Some stations already put "Artist - Title" in the track title; searching by it would find nothing or the wrong station.
+                if newTitle != station, let split = newTitle.range(of: " - ") {
+                    song = (String(newTitle[split.upperBound...]), String(newTitle[..<split.lowerBound]), nil)
+                }
+                if song == nil { song = await Self.fipNowPlaying(stream: stream, title: station) }
+                if song == nil { song = await radio.nowPlaying(station: station, stream: stream) }
+                if let song {
+                    newSource = station
                     newTitle = song.title
                     newSubtitle = song.artist
                     newArtwork = song.cover ?? newArtwork
@@ -188,6 +197,100 @@ final class Speaker: ObservableObject {
     func step(_ delta: Double) {
         volume = min(100, max(0, volume + delta))
         set(volume)
+    }
+}
+
+typealias Song = (title: String, artist: String, cover: URL?)
+
+// The speaker never exposes a radio station's real stream URL, so the station is looked up by name
+// in the public radio-browser.info directory and the song is read from the stream's ICY metadata.
+@MainActor
+final class RadioStreamLookup {
+    private var streams: [String: URL?] = [:]
+    private var lastRead: (station: String, at: Date, song: Song?)?
+
+    func nowPlaying(station: String, stream: String) async -> Song? {
+        // Each read opens the audio stream, so reuse the last result for a while.
+        if let lastRead, lastRead.station == station, Date().timeIntervalSince(lastRead.at) < 15 {
+            return lastRead.song
+        }
+        let url: URL?
+        if let cached = streams[station] {
+            url = cached
+        } else {
+            url = await Self.findStream(station: station, streamName: stream)
+            streams[station] = url
+        }
+        let song = url == nil ? nil : await Self.readStreamTitle(url!)
+        lastRead = (station, Date(), song)
+        return song
+    }
+
+    private static func findStream(station: String, streamName: String) async -> URL? {
+        guard !station.isEmpty,
+              let name = station.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "https://de1.api.radio-browser.info/json/stations/byname/\(name)?hidebroken=true&order=votes&reverse=true&limit=20")
+        else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.setValue("KEFVolume/1.0", forHTTPHeaderField: "User-Agent")
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let results = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return nil }
+        // Speaker stream names look like "fipcultes-hifi.aac"; a URL containing that stem is the strongest match.
+        let stem = String(streamName.split(separator: "-").first ?? "").lowercased()
+        func score(_ s: [String: Any]) -> Int {
+            let url = (s["url_resolved"] as? String ?? "").lowercased()
+            let exact = (s["name"] as? String)?.caseInsensitiveCompare(station) == .orderedSame
+            return (stem.count > 2 && url.contains(stem) ? 2 : 0) + (exact ? 1 : 0)
+        }
+        // Results arrive sorted by votes, and max(by:) keeps the first of equal scores.
+        let best = results
+            .filter { !($0["url_resolved"] as? String ?? "").lowercased().contains(".m3u8") }
+            .enumerated()
+            .max { (score($0.element), -$0.offset) < (score($1.element), -$1.offset) }?.element
+        return (best?["url_resolved"] as? String).flatMap(URL.init(string:))
+    }
+
+    private static func readStreamTitle(_ url: URL) async -> Song? {
+        var request = URLRequest(url: url, timeoutInterval: 6)
+        request.setValue("1", forHTTPHeaderField: "Icy-MetaData")
+        request.setValue("KEFVolume/1.0", forHTTPHeaderField: "User-Agent")
+        guard let (bytes, response) = try? await URLSession.shared.bytes(for: request) else { return nil }
+        defer { bytes.task.cancel() }
+        guard let interval = ((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "icy-metaint")).flatMap(Int.init),
+              interval > 0
+        else { return nil }
+        var iterator = bytes.makeAsyncIterator()
+        do {
+            for _ in 0..<interval { guard try await iterator.next() != nil else { return nil } }
+            guard let length = try await iterator.next() else { return nil }
+            var meta = [UInt8]()
+            for _ in 0..<(Int(length) * 16) {
+                guard let b = try await iterator.next() else { break }
+                meta.append(b)
+            }
+            let text = String(decoding: meta.filter { $0 != 0 }, as: UTF8.self)
+            return parse(text)
+        } catch {
+            return nil
+        }
+    }
+
+    // Metadata looks like: StreamTitle='Artist - Title';StreamUrl='...';
+    private static func parse(_ meta: String) -> Song? {
+        func field(_ name: String) -> String? {
+            guard let start = meta.range(of: "\(name)='") else { return nil }
+            let rest = meta[start.upperBound...]
+            let end = rest.range(of: "';")?.lowerBound ?? rest.endIndex
+            let value = rest[..<end].trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        guard let title = field("StreamTitle") else { return nil }
+        let cover = field("StreamUrl").flatMap(URL.init(string:)).flatMap {
+            ["jpg", "jpeg", "png", "webp"].contains($0.pathExtension.lowercased()) ? $0 : nil
+        }
+        guard let split = title.range(of: " - ") else { return (title, "", cover) }
+        return (String(title[split.upperBound...]), String(title[..<split.lowerBound]), cover)
     }
 }
 
