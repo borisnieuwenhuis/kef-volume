@@ -29,28 +29,32 @@ final class Speaker: ObservableObject {
         let meta = (track?["mediaData"] as? [String: Any])?["metaData"] as? [String: Any]
         let service = meta?["serviceID"] as? String ?? ""
 
-        playing = player?["state"] as? String == "playing"
-        source = physical == "wifi" ? Self.serviceName(service) : Self.inputName(physical)
-        guard physical == "wifi", let track else {
-            title = ""; subtitle = ""; artwork = nil
-            return
-        }
-        title = track["title"] as? String ?? ""
-        let artist = meta?["artist"] as? String ?? ""
-        let album = meta?["album"] as? String ?? ""
-        subtitle = [artist, album].filter { !$0.isEmpty }.joined(separator: " — ")
-        artwork = (track["icon"] as? String).flatMap(URL.init(string:))
-        if subtitle.isEmpty, meta?["radioStation"] as? Bool == true {
-            subtitle = meta?["slogan"] as? String ?? ""
-            let station = title
-            let stream = meta?["organization"] as? String ?? ""
-            if let song = await Self.fipNowPlaying(stream: stream, title: station) {
-                source = station
-                title = song.title
-                subtitle = song.artist
-                artwork = song.cover ?? artwork
+        let newPlaying = player?["state"] as? String == "playing"
+        var newSource = physical == "wifi" ? Self.serviceName(service) : Self.inputName(physical)
+        var newTitle = "", newSubtitle = "", newArtwork: URL?
+        if physical == "wifi", let track {
+            newTitle = track["title"] as? String ?? ""
+            let artist = meta?["artist"] as? String ?? ""
+            let album = meta?["album"] as? String ?? ""
+            newSubtitle = [artist, album].filter { !$0.isEmpty }.joined(separator: " — ")
+            newArtwork = (track["icon"] as? String).flatMap(URL.init(string:))
+            if newSubtitle.isEmpty, meta?["radioStation"] as? Bool == true {
+                newSubtitle = meta?["slogan"] as? String ?? ""
+                let stream = meta?["organization"] as? String ?? ""
+                if let song = await Self.fipNowPlaying(stream: stream, title: newTitle) {
+                    newSource = newTitle
+                    newTitle = song.title
+                    newSubtitle = song.artist
+                    newArtwork = song.cover ?? newArtwork
+                }
             }
         }
+        // Assigning a @Published property re-renders even when the value is the same, which makes the popover flicker.
+        if playing != newPlaying { playing = newPlaying }
+        if source != newSource { source = newSource }
+        if title != newTitle { title = newTitle }
+        if subtitle != newSubtitle { subtitle = newSubtitle }
+        if artwork != newArtwork { artwork = newArtwork }
     }
 
     // The speaker only reports the station for radio, so FIP songs come from Radio France's live feed.
